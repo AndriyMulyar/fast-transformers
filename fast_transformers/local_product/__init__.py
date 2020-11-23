@@ -22,6 +22,8 @@ except ImportError:
     local_weighted_average_cuda = None
     local_weighted_average_backward_cuda = None
 
+from .local_product_cuda_no_mm import local_dot_product as local_dot_product_cuda_no_mm
+VERSION = 'custom'
 
 class LocalDotProduct(torch.autograd.Function):
     """Compute the dot product of the queries and keys but only consider a
@@ -35,19 +37,30 @@ class LocalDotProduct(torch.autograd.Function):
         "cuda": local_dot_backward_cuda
     }
 
+
+
     @staticmethod
     def forward(ctx, queries, keys, attn_mask, key_lengths, local_context):
         # Save the inputs for the gradient computation
         ctx.save_for_backward(queries, keys, key_lengths)
         ctx.local_context = local_context
+        if VERSION == 'custom':
+            return local_dot_product_cuda_no_mm(
+                queries,
+                keys,
+                attn_mask,
+                key_lengths,
+                local_context
+            )
+        else:
+            return LocalDotProduct.dot[queries.device.type](
+                queries,
+                keys,
+                attn_mask,
+                key_lengths,
+                local_context
+            )
 
-        return LocalDotProduct.dot[queries.device.type](
-            queries,
-            keys,
-            attn_mask,
-            key_lengths,
-            local_context
-        )
 
     @staticmethod
     def backward(ctx, grad_input):
