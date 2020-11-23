@@ -1,8 +1,4 @@
 //
-// A faster sliding window attention variant.
-// Andriy Mulyar <contact@andriymulyar.com>
-//
-// Adapted from the skeleton of the sliding window implementation of:
 // Copyright (c) 2020 Idiap Research Institute, http://www.idiap.ch/
 // Written by Angelos Katharopoulos <angelos.katharopoulos@idiap.ch>
 //
@@ -49,11 +45,11 @@ struct masked_lp_copy
         int buffer_dim2
     ) {
         int idx = blockIdx.x*blockDim.x + threadIdx.x;
-        int n = idx / buffer_dim12; //the nth sequence in the batch, divide by the ~ num_queries*block_a (slightly larger due to context)
-        idx = idx - n*buffer_dim12; //set idx to the n'th sequence
-        int l_offset = idx / buffer_dim2; //the l'th query in the n'th sequence
-        idx = idx - l_offset*buffer_dim2; //set idx to the l'th query in the sequence
-        int s_offset = idx; //
+        int n = idx / buffer_dim12;
+        idx = idx - n*buffer_dim12;
+        int l_offset = idx / buffer_dim2;
+        idx = idx - l_offset*buffer_dim2;
+        int s_offset = idx;
 
         if (n >= buffer.size(0)) {
             return;
@@ -153,40 +149,13 @@ __global__ void sliding_dot_copy_kernel(
     );
 }
 
-/**
-* A kernel that dots the queries with a local context window keys. Each thread performs a dot product.
-* Computes a single element of out (N, L, local_context)
-*
-* Assumes N*H*L number of thread blocks each containing context_window threads.
-* Arguments
-* ---------
-*     copy_implementation: The kernel implementation that selects the results.
-*     XQ: Tensor of shape (N*H, L, E)
-*     XV: Tensor of shape (N*H, L, E)
-*     out: Tensor of shape (N*H, L, local_context)
-*/
-__global__ void local_dot_product_kernel(float3_accessor XQ, float3_accessor XK,
-                                         float3_accessor out, int local_context, int L, int E){
-    int batch_index = blockIdx.x; //the key,context_window pair we are computing the dot products for
-    int query = blockIdx.x / L; // the query this thread is dotting with
-
-    // The value this threads query is dotted with.
-    // Each thread in block handles one element of the window.
-    int value = query - local_context/2 + threadIdx.x;
-    //ignore context window elements that cross the boundaries of the input X
-    if(value < 0 || value >= L){
-        return;
-    }
-    for(int i = 0; i < E; i++){
-        out[batch_index][query][threadIdx.x] += XQ[batch_index][query][i]*XK[batch_index][value][i];
-    }
-}
 
 /**
  * Multiply every A_i with every B_j iff |i-j| < local_context/2.
  *
- * This operation is delegated to a custom kernel that takes as input XQ and XK
- * matrices and perform a dot product in a local context window.
+ * The strategy is to compute the local products in blocks and keep the GPU
+ * busy and then select the valid results from all the intermediate ones using
+ * the copy implementation.
  *
  * Arguments
  * ---------
@@ -203,23 +172,46 @@ void sliding_dot(
     torch::Tensor out,
     int local_context
 ) {
-    int N = A.size(0); // batch size (not the number of instances, but number of instances times number of attention heads).
-    int L = A.size(1); // number of queries and keys
+    int N = A.size(0);
+    int L = A.size(1);
 
-    dim3 gridDim(N * L);// a thread block for each query, in each instance
-    dim3 blockDim(local_context); //a thread for each value in the context window of the query.
-
-    local_dot_product_kernel<<<gridDim, blockDim>>>(
-        A.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
-        B.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
-        out.packed_accessor32<float, 3, torch::RestrictPtrTraits>(), // dim are (N, L, context size)
-        local_context,
-        L,
-        A.size(2)
+    // Save the intermediate results in here
+    auto buffer = torch::zeros(
+        {N, a_blocks, a_blocks+local_context},
+        A.options()
     );
 
-    }
+    for (int l=0; l<L; l+=a_blocks) {
+        // Compute the sizes of the sub problems to be computed in this
+        // block iteration
+        int s_start = std::max(0, l-local_context/2);
+        int s_end = std::min(L, l-local_context/2+local_context+a_blocks);
+        int n_b = s_end-s_start;
+        int n_a = std::min(L-l, a_blocks);
 
+        // Compute the dot products
+        auto buff = buffer.narrow(1, 0, n_a).narrow(2, 0, n_b);
+        at::matmul_out(
+            buff,
+            A.narrow(1, l, n_a),
+            B.narrow(1, s_start, n_b).transpose(1, 2)
+        );
+
+        // Select the correct results from the buffer
+        const int threads = 1024;
+        int blocks = ceildiv(buff.numel(), threads);
+        sliding_dot_copy_kernel<<<blocks, threads>>>(
+            copy_implementation,
+            buff.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+            out.packed_accessor32<float, 3, torch::RestrictPtrTraits>(),
+            local_context,
+            l,
+            s_start,
+            buff.size(1)*buff.size(2),
+            buff.size(2)
+        );
+    }
+}
 
 
 template <

@@ -22,8 +22,8 @@ except ImportError:
     local_weighted_average_cuda = None
     local_weighted_average_backward_cuda = None
 
-from .local_product_cuda_no_mm import local_dot_product as local_dot_product_cuda_no_mm
-VERSION = 'custom'
+# from .local_product_cuda_no_mm import local_dot_product as local_dot_product_cuda_no_mm
+VERSION = 'native'
 
 class LocalDotProduct(torch.autograd.Function):
     """Compute the dot product of the queries and keys but only consider a
